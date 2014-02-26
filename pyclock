@@ -1,0 +1,28 @@
+#!/usr/bin/env python
+
+import gtk
+import sys
+import egg.trayicon
+
+class ClockIcon:
+    def __init__(self):
+        self.tray = egg.trayicon.TrayIcon(name)
+        self.eventbox = gtk.EventBox()
+        self.label=gtk.Label("")
+        self.eventbox.add(self.label)
+        self.update()
+        self.tray.add(self.eventbox)
+        self.tray.show_all()
+        gobject.timeout_add(1000,self.update)
+
+    def update(self):
+        self.label.set_label(time.strftime(CLOCK_FORMAT, time.localtime()))
+        self.label.set_tooltip_text(time.strftime(CLOCK_TOOLTIP, time.localtime()))
+        return True
+
+def run(args):
+    ClockIcon()
+    gtk.main()
+
+if __name__ == "__main__":
+    run(sys.argv[1:])

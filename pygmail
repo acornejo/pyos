@@ -1,0 +1,185 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import time
+import random
+import getpass
+
+import feedparser
+import urllib
+import xml
+
+import gtk
+import gobject
+try:
+    import pynotify
+    PYNOTIFY = True
+except:
+    PYNOTIFY = False
+
+BLOCK_NOTIFY = os.environ['HOME']+"/.pygmail_blocknotify"
+AUTH_FILE = os.environ['HOME']+"/.pygmailrc"
+
+def escape_string(string):
+    return xml.sax.saxutils.escape(string)
+
+def format_time(ptime):
+    ctime=time.gmtime()
+    dtime=[ptime[i]-ctime[i] for i in range(6)]
+    units=["year","month","day","hour","minute","second"]
+    strtime="now"
+    for i in range(6):
+        if dtime[i] != 0:
+            if dtime[i] > 1:
+                strtime="about %s %ss ago"%(dtime[i],units[i])
+            else:
+                strtime="about %s %s ago"%(dtime[i],units[i])
+            break
+    return strtime
+
+def send_message(icon,title,body,timeout=15000,type="dialog-info"):
+    n=pynotify.Notification(title,body,type)
+    n.attach_to_status_icon(icon)
+    n.set_urgency(pynotify.URGENCY_NORMAL)
+    n.set_timeout(timeout)
+    n.show()
+
+def read_auth(filename):
+    random.seed(1234)
+    if os.path.exists(filename):
+        f=open(filename,'rb')
+        string=f.read()
+        f.close()
+        instring=str()
+        for i in xrange(512):
+            instring=instring+chr(ord(string[i])^random.randint(0,255))
+        return instring.split('\n')[0:2]
+    else:
+        username=raw_input('username: ')
+        password=getpass.getpass()
+        print "INFO: If you decide to cache the info, it will be saved unencrypted"
+        print "      and readable by anyone with access to the file %s"%filename
+        save=raw_input("Cache login info? [y/n] ")
+        if save.lower().startswith("y"):
+            string="%s\n%s\n"%(username,password)
+            string=string.ljust(512)
+            outstring=str()
+            for i in xrange(512):
+                outstring=outstring+chr(ord(string[i])^random.randint(0,255))
+            f=open(filename,'wb')
+            os.chmod(filename,0600)
+            f.write(outstring)
+            f.close()
+            print "Saved login info to %s"%filename
+        else:
+            print "Did not save login info."
+        return (username,password)
+
+class GmailSensor(gobject.GObject):
+    GMAIL_URL = "https://mail.google.com/gmail/feed/atom"
+    __gsignals__ = {
+            'updated': (gobject.SIGNAL_RUN_LAST, gobject.TYPE_NONE, ())
+            }
+
+    def __init__(self,timeout,user,passwd,nowait=False):
+        gobject.GObject.__init__(self)
+        self.unread_count=0
+        self.messages=[]
+        class SecureOpener(urllib.FancyURLopener):
+            def prompt_user_passwd(self,host,realm):
+                return (user,passwd)
+        self.opener=SecureOpener()
+        gobject.timeout_add(timeout,self.update)
+        if not nowait:
+            gobject.timeout_add(500,self.first_run)
+
+    def first_run(self):
+        self.update()
+        return False
+
+    def update(self):
+        f = self.opener.open(self.GMAIL_URL)
+        feed = f.read()
+        atom = feedparser.parse(feed)
+        try:
+            unread_count=int(atom.feed.fullcount)
+        except:
+            unread_count=0
+
+        messages=[]
+        if len(atom.entries) > 0:
+            for entry in atom.entries:
+                messages.append((entry.author,entry.title,entry.summary,entry.published_parsed))
+
+        if unread_count != self.unread_count or messages != self.messages:
+            self.unread_count=unread_count
+            self.messages=messages
+            self.emit('updated')
+        return True
+
+class MailMonitor(gtk.StatusIcon):
+    def __init__(self,sensor):
+        gtk.StatusIcon.__init__(self)
+        self.set_from_icon_name('mail-mark-important')
+        self.set_visible(False)
+        self.sensor=sensor
+        self.text=""
+        self.sensor.connect('updated',self.on_update)
+        self.connect('activate', lambda x: self.sensor.update())
+
+    def on_update(self,sensor):
+        if sensor.unread_count > 0:
+            text=""
+            text_unread="%d unread messages"%sensor.unread_count
+            for msg in sensor.messages:
+                author, title, summary, time = msg
+                text=text+"\nFrom: %s\nSubject: %s\nSummary: %s\nSent: %s\n"\
+                        %(escape_string(author),escape_string(title),escape_string(summary),format_time(time))
+            self.set_visible(True)
+            self.set_tooltip("Mailbox Summary: %s\n%s"%(text_unread,text))
+            if self.text != text:
+                self.text=text
+                if not os.path.exists(BLOCK_NOTIFY) and PYNOTIFY:
+                    send_message(self,text_unread,text)
+        else:
+            self.set_visible(False)
+            self.set_tooltip("No unread messages")
+
+def run(args):
+    if PYNOTIFY:
+        pynotify.init("pygmail")
+    username=None
+    password=None
+    auth=AUTH_FILE
+    update=1000*5*60
+    unread_count=False
+    for arg in args:
+        if arg.startswith("--auth="):
+            auth=arg.split("=")[1]
+        elif arg.startswith("--username="):
+            username=arg.split("=")[1]
+        elif arg.startswith("--password="):
+            password=arg.split("=")[1]
+        elif arg.startswith("--update="):
+            update=1000*int(arg.split("=")[1])
+        elif arg.startswith("--unread_count"):
+            unread_count=True
+        else:
+            print "Invalid argument %s"%arg
+            print "Usage: pygmail [--auth=FILE] [--username=USER] [-password=PASS] [--update=SECONDS] [--unread_count]"
+            return
+
+    if not username or not password:
+        username,password=read_auth(auth)
+
+    if unread_count:
+        sensor=GmailSensor(update,username,password,True)
+        sensor.update()
+        print "%d"%sensor.unread_count
+    else:
+        MailMonitor(GmailSensor(update,username,password))
+        gtk.main()
+
+if __name__ == "__main__":
+    run(sys.argv[1:])

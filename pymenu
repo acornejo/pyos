@@ -1,0 +1,122 @@
+#!/usr/bin/env python
+
+import sys
+import os.path
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+import gtk
+import subprocess
+import xdg.Config
+import xdg.Menu
+import xdg.IconTheme
+
+dbus_service_name = "net.pydesktop.PyMenu"
+dbus_service_iface = "net.pydesktop.PyMenuInterface"
+dbus_service_object = "/net/pydesktop/PyMenu"
+
+class XdgMenu(gtk.Menu):
+    def __init__(self, xmenu, **kw):
+        gtk.Menu.__init__(self)
+        for e in xmenu.getEntries(hidden = kw.get('show_hidden', False)):
+            if isinstance(e, xdg.Menu.Menu):
+                submenu=XdgMenu(e,**kw)
+                if submenu.get_children() == 0: continue
+                item = XdgMenuItem(e, **kw)
+                item.set_submenu(submenu)
+                self.append(item)
+            elif isinstance(e, xdg.Menu.MenuEntry):
+                item = XdgMenuItem(e.DesktopEntry, **kw)
+                item.connect("activate", item.run)
+                self.append(item)
+
+class XdgMenuItem(gtk.ImageMenuItem):
+    def __init__(self, xentry, **kw):
+        gtk.ImageMenuItem.__init__(self, xentry.getName())
+        cmt=xentry.getComment()
+        if len(cmt) > 0:
+            self.set_tooltip_text(cmt)
+        self.xentry = xentry
+        icon_size = kw.get('icon_size', gtk.ICON_SIZE_MENU)
+        if icon_size != gtk.ICON_SIZE_INVALID:
+            s, s = gtk.icon_size_lookup(icon_size)
+            icon_path = xdg.IconTheme.getIconPath(self.xentry.getIcon(), s)
+            if icon_path:
+                w, h = gtk.icon_size_lookup(icon_size)
+                try:
+                    pixbuf = gtk.gdk.pixbuf_new_from_file(icon_path)
+                    pixbuf = pixbuf.scale_simple(w, h, gtk.gdk.INTERP_BILINEAR)
+                    img = gtk.Image()
+                    img.set_from_pixbuf(pixbuf)
+                    self.set_image(img)
+                except:
+                    icon_path = None
+            if not icon_path and kw.get('show_missing',True):
+                if isinstance(xentry, xdg.Menu.Menu):
+                    self.set_image(gtk.image_new_from_stock(gtk.STOCK_DIRECTORY, icon_size))
+                else:
+                    self.set_image(gtk.image_new_from_stock(gtk.STOCK_FILE, icon_size))
+
+    def run(self, *args):
+        xtype = self.xentry.getType()
+        if xtype == "Application":
+            cmdv=[]
+            for c in self.xentry.getExec().split(' '):
+                if not c.startswith("%"):
+                    cmdv=cmdv+[c]
+            if self.xentry.getTerminal():
+                cmdv = ['x-terminal-emulator','-e'] + cmdv
+        elif xtype == "Link":
+            cmdv = ['x-www-browser', self.xentry.getURL()]
+        else:
+            return
+        subprocess.Popen(cmdv)
+
+class PyMenu:
+    class DBusObject(dbus.service.Object):
+        def __init__(self, menu, bus, path):
+            dbus.service.Object.__init__(self, bus, path)
+            self.menu = menu
+
+        @dbus.service.method(dbus_service_iface, in_signature='', out_signature='')
+        def Popup(self):
+            self.menu.popup()
+
+    def __init__(self, icon_size, show_missing, show_hidden):
+        xdg.Config.setIconTheme(gtk.settings_get_default().get_property("gtk-icon-theme-name"))
+        self._start_menu = None
+        self.icon_size = icon_size
+        self.show_missing = show_missing
+        self.show_hidden = show_hidden
+        self.DBusObject(self, dbus.SessionBus(), dbus_service_object)
+
+    def get_start_menu(self):
+        if self._start_menu is None:
+            self._start_menu = XdgMenu(xdg.Menu.parse(),
+              icon_size = self.icon_size,
+              show_missing = self.show_missing,
+              show_hidden = self.show_hidden)
+        return self._start_menu
+
+    def popup(self):
+        m = self.get_start_menu()
+        m.show_all()
+        def position_menu(menu):
+            x, y, mods = gtk.gdk.get_default_root_window().get_pointer()
+            return (x, y, True)
+        m.popup(None, None, position_menu, 0, gtk.get_current_event_time())
+        return True
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default = True)
+        dbus_bus_name = dbus.service.BusName(dbus_service_name, dbus.SessionBus())
+        m = PyMenu(gtk.ICON_SIZE_MENU,1,0)
+        m.popup()
+        gtk.main()
+    else:
+        try:
+            m = dbus.SessionBus().get_object(dbus_service_name, dbus_service_object)
+            m.Popup()
+        except:
+            subprocess.Popen([__file__,'--daemon']+sys.argv[1:])

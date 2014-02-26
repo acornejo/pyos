@@ -1,0 +1,186 @@
+#!/usr/bin/env python
+
+import mpdclient2
+import time
+import gtk
+import gobject
+import sys
+
+PROG_NAME = "PyMPC"
+COPYRIGHT = 'Copyright (c) 2008, Alex Cornejo'
+LICENSE = 'This software is released under the terms of the GNU GPL version 2 and above.\n Please read the license at http://www.gnu.org/copyleft/gtpl.html'
+AUTHOR = 'Alex Cornejo <acornejo@gmail.com>'
+VERSION = '1.0'
+
+class mpdclient2_connection:
+    def __init__(self):
+        self.lasttime=0
+        self.timeout=20
+
+    def __getattr__(self,attr):
+        curtime=time.time()
+        if curtime-self.lasttime > self.timeout:
+            self.conn=mpdclient2.connect()
+        self.lasttime=curtime
+        return getattr(self.conn,attr)
+
+class MPC:
+    def __init__(self):
+        self.cl=mpdclient2_connection()
+
+    def play_pause(self):
+        if self.is_playing():
+            self.cl.do.pause(1)
+        else:
+            self.cl.do.play()
+
+    def stop(self):
+        self.cl.do.stop()
+
+    def get_playing(self):
+        track=self.cl.do.currentsong()
+        try:
+            return "%s - %s"%(track['artist'],track['title'])
+        except:
+            return track['file']
+
+    def print_status(self):
+        print "Song: %s"%self.get_playing()
+        if self.is_playing():
+            print "Status: Playing"
+        else:
+            print "Status: Paused"
+        if self.is_shuffle():
+            print "Shuffle: on"
+        else:
+            print "Shuffle: off"
+        if self.is_repeat():
+            print "Repeat: on"
+        else:
+            print "Repeat: off"
+
+    def is_playing(self):
+        stat=self.cl.do.status()
+        return stat['state'] == 'play'
+
+    def is_shuffle(self):
+        stat=self.cl.do.status()
+        return stat['random'] == '1'
+
+    def is_repeat(self):
+        stat=self.cl.do.status()
+        return stat['repeat'] == '1'
+
+    def toggle_shuffle(self):
+        if self.is_shuffle():
+            self.cl.do.random(0)
+        else:
+            self.cl.do.random(1)
+
+    def toggle_repeat(self):
+        if self.is_repeat():
+            self.cl.do.repeat(0)
+        else:
+            self.cl.do.repeat(1)
+
+    def next(self):
+        self.cl.do.next()
+
+    def prev(self):
+        self.cl.do.previous()
+
+class MPCIcon(gtk.StatusIcon):
+    def __init__(self,mpc):
+        gtk.StatusIcon.__init__(self)
+        self.set_from_icon_name('audio-x-generic')
+        self.connect('activate',self.clicked)
+        self.connect('popup-menu',self.menu)
+        self.mpc=mpc
+        self.update_tooltip()
+        gobject.timeout_add(1000,self.update_tooltip)
+
+    def update_tooltip(self):
+        if self.mpc.is_playing():
+            self.set_tooltip(self.mpc.get_playing())
+        else:
+            self.set_tooltip('[Not playing] '+self.mpc.get_playing())
+        return True
+
+    def clicked(self,widget):
+        self.mpc.play_pause()
+
+    def menu(self,icon,button,activate_time):
+        menu=gtk.Menu()
+        if self.mpc.is_playing():
+            play=gtk.ImageMenuItem(gtk.STOCK_MEDIA_PAUSE)
+        else:
+            play=gtk.ImageMenuItem(gtk.STOCK_MEDIA_PLAY)
+        play.connect('activate', lambda x: self.mpc.play_pause())
+        stop=gtk.ImageMenuItem(gtk.STOCK_MEDIA_STOP)
+        stop.connect('activate', lambda x: self.mpc.stop())
+        next=gtk.ImageMenuItem(gtk.STOCK_MEDIA_NEXT)
+        next.connect('activate', lambda x: self.mpc.next())
+        prev=gtk.ImageMenuItem(gtk.STOCK_MEDIA_PREVIOUS)
+        prev.connect('activate', lambda x: self.mpc.prev())
+        shuffle=gtk.CheckMenuItem("Shuffle")
+        shuffle.set_active(self.mpc.is_shuffle())
+        shuffle.connect('toggled', lambda x: self.mpc.toggle_shuffle())
+        repeat=gtk.CheckMenuItem("Repeat")
+        repeat.set_active(self.mpc.is_repeat())
+        repeat.connect('toggled', lambda x: self.mpc.toggle_repeat())
+        sep=gtk.SeparatorMenuItem()
+        about=gtk.ImageMenuItem(gtk.STOCK_ABOUT)
+        about.connect('activate', self.about)
+        quit=gtk.ImageMenuItem(gtk.STOCK_QUIT)
+        quit.connect('activate', lambda x: gtk.main_quit())
+        menu.append(stop)
+        menu.append(play)
+        menu.append(next)
+        menu.append(prev)
+        menu.append(shuffle)
+        menu.append(repeat)
+        menu.append(sep)
+        menu.append(about)
+        menu.append(quit)
+        menu.show_all()
+        menu.popup(None,None,gtk.status_icon_position_menu,button,activate_time,icon)
+
+    def about(self,item):
+        dlg = gtk.AboutDialog()
+        dlg.set_name(PROG_NAME)
+        dlg.set_version(VERSION)
+        dlg.set_copyright(COPYRIGHT)
+        dlg.set_license(LICENSE)
+        dlg.set_authors((AUTHOR,))
+        dlg.run()
+        dlg.destroy()
+
+def run(args):
+    if len(args) > 0:
+        mpc=MPC()
+        for arg in args:
+            if arg == "--play-pause":
+                mpc.play_pause()
+            elif arg == "--next":
+                mpc.next()
+            elif arg == "--prev":
+                mpc.prev()
+            elif arg == "--shuffle":
+                mpc.toggle_shuffle()
+            elif arg == "--repeat":
+                mpc.toggle_repeat()
+            elif arg == "--status":
+                mpc.print_status()
+            elif arg == "--icon":
+                icon=MPCIcon(mpc)
+                gtk.main()
+            else:
+                print "Invalid argument %s\n"%arg
+                return
+    else:
+        print "%s %s     %s\n"%(PROG_NAME,VERSION,COPYRIGHT)
+        print "Usage: pympc [--play-pause] [--next] [--prev] [--shuffle] [--repeat] [--status] [--icon]\n"
+        print "%s\n"%LICENSE
+
+if __name__ == "__main__":
+    run(sys.argv[1:])

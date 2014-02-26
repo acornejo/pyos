@@ -1,0 +1,296 @@
+#!/usr/bin/env python
+# TODO: Memory, Battery and GCalendar
+
+import os
+import math
+import time
+
+import re         # for CpuGraph
+import subprocess # for Battery
+
+import gtk
+import gobject
+import egg.trayicon
+
+CPU_WIDTH = 24
+CPU_QUERY = 1000
+CPU_TOOLTIP = "CPU Usage: %.2f%%"
+
+NET_WIDTH = 24
+NET_QUERY = 1000
+NET_TOOLTIP = "Down: %s\nUp: %s"
+
+BAT_QUERY = 1000*30
+BAT_TOOLTIP = "Status: %s\nCharged: %.2f%%\n%s"
+
+def format_bytes(bytes):
+   "Converts bytes to a better format"
+   formats = ("bytes", "kB", "MB", "GB")
+   if bytes == 0: return "%.1f %s" % (0.0, formats[0])
+   power = min(int(math.log(bytes, 2**10)), len(formats)-1) # do tricky stuff
+   return "%.1f %s" % (bytes/2.0**(10*power), formats[power])
+
+class BatterySensor(gobject.GObject):
+    __gsignals__ = {
+            'updated': (gobject.SIGNAL_RUN_LAST, gobject.TYPE_NONE, ())
+            }
+    def __init__(self,timeout):
+        gobject.GObject.__init__(self)
+        self.status="nobattery"
+        self.amount=100.0
+        self.time=""
+        gobject.timeout_add(timeout,self.update)
+
+    def update(self):
+        f = subprocess.Popen(["acpi","-b"],stdout=subprocess.PIPE)
+        for line in f.stdout.xreadlines():
+            m=re.match("(\s+.*:\s)(.*)",line)
+            if m:
+                vec = re.split(",\s",m.group(2))
+                if len(vec) == 3:
+                    self.status,amount,self.time = vec
+                else:
+                    self.status,amount=vec
+                    self.time="Fully charged"
+                self.amount=float(amount[0:len(amount)-1])
+                break
+        f.stdout.close()
+        f.wait()
+        self.emit('updated')
+
+        return True
+
+class CPUSensor(gobject.GObject):
+    __gsignals__ = {
+            'updated': (gobject.SIGNAL_RUN_LAST, gobject.TYPE_NONE, ())
+            }
+    def __init__(self,device,hist_size,timeout):
+        gobject.GObject.__init__(self)
+        self.device=device
+        self.hist_size=hist_size
+        self.hist=[]
+        self.activity=0.0
+        self.last_value = None
+        gobject.timeout_add(timeout,self.update)
+
+    def read_stat(self):
+        f = open("/proc/stat")
+        for line in f.xreadlines():
+            if line.startswith("%s "%self.device):
+                cpu, user, nice, sys, idle = re.split("\s+", line.strip())[:5]
+                break
+        f.close()
+        return (long(user) + long(nice + sys), long(idle))
+
+    def update(self):
+        new_value = self.read_stat()
+
+        if self.last_value:
+            active = new_value[0] - self.last_value[0]
+            idle = new_value[1] - self.last_value[1]
+            if active + idle > 0:
+                self.activity=active/float(active+idle)
+                self.hist.append(self.activity)
+                self.emit('updated')
+
+        self.last_value = new_value
+
+        while (len(self.hist) < self.hist_size):
+            self.hist.insert(0,0.0)
+        while (len(self.hist) > self.hist_size):
+            self.hist.pop(0)
+
+        return True
+
+class NetworkSensor(gobject.GObject):
+    __gsignals__ = {
+            'updated': (gobject.SIGNAL_RUN_LAST, gobject.TYPE_NONE, ())
+            }
+    def __init__(self,device,hist_size,timeout,timeout_max=30000):
+        gobject.GObject.__init__(self)
+        self.device=device
+        self.hist_size=hist_size
+        self.last_value=None
+        self.hist_rx=[]
+        self.hist_tx=[]
+        self.avg_rx=0.0
+        self.avg_tx=0.0
+        self.max_rx=1.0
+        self.max_tx=1.0
+        gobject.timeout_add(timeout,self.update)
+        gobject.timeout_add(timeout_max,self.calc_max)
+
+    def calc_max(self):
+        if len(self.hist_rx) > 0:
+            self.max_rx=max(1.0,max(self.hist_rx))
+        if len(self.hist_tx) > 0:
+            self.max_tx=max(1.0,max(self.hist_tx))
+        return True
+
+    def read_stat(self):
+        f = open("/proc/net/dev")
+        for line in f.xreadlines():
+            m=re.match("(\s+%s:)(.*)"%self.device,line)
+            if m:
+                rx, d1, d2, d3, d4, d5, d6, d7, tx = re.split("\s+",m.group(2).strip())[:9]
+                break
+        f.close()
+        return (long(rx), long(tx))
+
+    def update(self):
+        new_value = self.read_stat()
+
+        if self.last_value:
+            rx = float(new_value[0]-self.last_value[0])
+            tx = float(new_value[1]-self.last_value[1])
+            if rx >= 0.0 and tx >= 0.0:
+                self.hist_rx.append(rx)
+                self.hist_tx.append(tx)
+                self.avg_rx=sum(self.hist_rx)/(len(self.hist_rx)*NET_QUERY/1000)
+                self.avg_tx=sum(self.hist_tx)/(len(self.hist_tx)*NET_QUERY/1000)
+                if rx > self.max_rx:
+                    self.max_rx=rx
+                if tx > self.max_tx:
+                    self.max_tx=tx
+                self.emit('updated')
+            else:
+                self.avg_rx=0.0
+                self.avg_tx=0.0
+                self.max_rx=1.0
+                self.max_tx=1.0
+                self.hist_rx=[]
+                self.hist_tx=[]
+        self.last_value = new_value
+
+        while (len(self.hist_rx) < self.hist_size):
+            self.hist_rx.insert(0,0.0)
+            self.hist_tx.insert(0,0.0)
+        while (len(self.hist_rx) > self.hist_size):
+            self.hist_rx.pop(0)
+            self.hist_tx.pop(0)
+
+        return True
+
+class GraphDisplay(gtk.DrawingArea):
+    def __init__(self,color,width=0,height=0):
+        gtk.DrawingArea.__init__(self)
+        self.points=[]
+        self.color=color
+        self.connect('expose-event',self.on_expose_event)
+        self.set_size_request(width,height)
+
+    def on_expose_event(self,widget,event):
+        cr=widget.window.cairo_create()
+        cr.rectangle(event.area.x, event.area.y, event.area.width, event.area.height)
+        cr.clip()
+        width, height = widget.window.get_size()
+        cr.set_source_rgb(1.0, 1.0, 1.0)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+        if len(self.points) > 0:
+            cr.scale(float(width)/float(len(self.points)),1)
+            cr.set_line_width(0.6)
+            cr.set_source_rgb(*self.color)
+            cr.move_to(0,height)
+            for i in range(len(self.points)):
+                cr.line_to(i,height-self.points[i]*height)
+            cr.stroke()
+
+class BatteryMonitor(gtk.Image):
+    def __init__(self,sensor):
+        gtk.Image.__init__(self)
+        self.sensor=sensor
+        self.sensor.connect('updated',self.on_update)
+        self.show()
+        self.sensor.update()
+
+    def on_update(self,sensor):
+        if sensor.status == "nobattery" or sensor.status == "charged":
+            self.clear()
+        elif sensor.amount >= 95.0:
+            self.set_from_icon_name('battery',gtk.ICON_SIZE_SMALL_TOOLBAR)
+        elif sensor.amount <= 15.0:
+            self.set_from_icon_name('battery-caution',gtk.ICON_SIZE_SMALL_TOOLBAR)
+        else:
+            self.set_from_icon_name('battery-low',gtk.ICON_SIZE_SMALL_TOOLBAR)
+        self.set_tooltip_text(BAT_TOOLTIP%(sensor.status,sensor.amount,sensor.time))
+        self.trigger_tooltip_query()
+
+class CPUMonitor(gtk.Viewport):
+    def __init__(self,sensor):
+        gtk.Viewport.__init__(self)
+        self.graph=GraphDisplay((1.0,0.0,0.0),CPU_WIDTH,0)
+        self.sensor=sensor
+        self.add(self.graph)
+        self.show()
+        self.sensor.connect('updated',self.on_update)
+
+    def on_update(self,sensor):
+        self.set_tooltip_text(CPU_TOOLTIP%(sensor.activity*100.0))
+        self.trigger_tooltip_query()
+        self.graph.points=sensor.hist
+        self.graph.queue_draw()
+
+class NetworkMonitor(gtk.Viewport):
+    def __init__(self,sensor):
+        gtk.Viewport.__init__(self)
+        self.graph_rx=GraphDisplay((0.0,1.0,0.0),CPU_WIDTH,0)
+        self.graph_tx=GraphDisplay((1.0,0.0,0.0),CPU_WIDTH,0)
+        self.sensor=sensor
+        vbox=gtk.VBox()
+        vbox.add(self.graph_rx)
+        vbox.add(self.graph_tx)
+        self.add(vbox)
+        self.show()
+        self.sensor.connect('updated',self.on_update)
+
+    def on_update(self,sensor):
+        self.set_tooltip_text(NET_TOOLTIP%(format_bytes(sensor.avg_rx),format_bytes(sensor.avg_tx)))
+        self.trigger_tooltip_query()
+        self.graph_rx.points=[sensor.hist_rx[i]/sensor.max_rx for i in range(len(sensor.hist_rx))]
+        self.graph_tx.points=[sensor.hist_tx[i]/sensor.max_tx for i in range(len(sensor.hist_tx))]
+        self.graph_rx.queue_draw()
+        self.graph_tx.queue_draw()
+
+class TrayIcon:
+    def __init__(self,name,monitor):
+        self.tray = egg.trayicon.TrayIcon(name)
+        self.eventbox = gtk.EventBox()
+
+        self.monitor=monitor
+        self.eventbox.add(self.monitor)
+        self.tray.add(self.eventbox)
+        self.tray.show_all()
+        self.eventbox.connect("button_press_event", self.on_click)
+        self.menu = tray_menu(self)
+
+    def on_click(self,widget,event):
+        if event.button == 1:
+            self.monitor.update()
+        if event.button == 3:
+            self.menu.popup(event)
+
+class tray_menu:
+    def __init__(self,tray):
+        self.tray=tray
+        self.menu = gtk.Menu()
+        item_quit = gtk.ImageMenuItem('gtk-quit',None)
+        item_quit.connect('activate',self.on_quit)
+        self.menu.add(item_quit)
+        self.menu.show_all()
+
+    def on_quit(self,widget):
+        self.tray.tray.destroy()
+
+    def popup(self,event):
+        self.menu.popup( None, None, None, 0, event.time );
+
+#---------------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    cpu=CPUSensor("cpu",CPU_WIDTH,CPU_QUERY)
+    bat=BatterySensor(BAT_QUERY)
+    net=NetworkSensor("eth0",NET_WIDTH,NET_QUERY)
+    TrayIcon("battery",BatteryMonitor(bat))
+    TrayIcon("cpu_monitor",CPUMonitor(cpu))
+    TrayIcon("net_monitor",NetworkMonitor(net))
+    gtk.main()

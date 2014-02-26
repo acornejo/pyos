@@ -1,0 +1,271 @@
+#!/usr/bin/env python
+
+import gtk
+import gobject
+import sys
+import os
+
+FILE_EXTENSIONS = ("jpg","bmp","tif","png","svg","gif")
+
+class ImageCollection(gtk.IconView):
+    def __init__(self,directory=None):
+        gtk.IconView.__init__(self)
+        self.dirname=directory
+        self.update()
+
+    def update(self):
+        if self.dirname != None:
+            self.files=filter(lambda x: x[len(x)-3:].lower() in FILE_EXTENSIONS, os.listdir(self.dirname))
+            self.set_model(gtk.ListStore(str,gtk.gdk.Pixbuf,str))
+            self.set_text_column(-1)
+            self.set_pixbuf_column(1)
+            self.set_tooltip_column(2)
+            self.set_selection_mode(gtk.SELECTION_BROWSE)
+            self.deficon=gtk.gdk.Pixbuf(gtk.gdk.COLORSPACE_RGB,True,8,100,100)
+            self.set_item_width(self.deficon.get_width())
+            self.deficon.fill(0xffffffff)
+            for file in self.files:
+                self.get_model().append([file,self.deficon,file])
+            if len(self.files) > 0:
+                self.last=self.get_model().get_iter_root()
+                gobject.idle_add(self.idle().next)
+        else:
+            self.files=[]
+
+    def idle(self):
+        while (self.last):
+            file=self.get_model().get_value(self.last,0)
+            try:
+                fullname=os.path.join(self.dirname,file)
+                info,owidth,oheight = gtk.gdk.pixbuf_get_file_info(fullname)
+                temp=self.deficon.copy()
+                if owidth > temp.get_width() or oheight > temp.get_height():
+                    pixbuf=gtk.gdk.pixbuf_new_from_file_at_size(fullname,self.deficon.get_width(),self.deficon.get_height())
+                else:
+                    pixbuf=gtk.gdk.pixbuf_new_from_file(fullname)
+                width=pixbuf.get_width()
+                height=pixbuf.get_height()
+                ox=(temp.get_width()-width)/2
+                oy=(temp.get_height()-height)/2
+                pixbuf.copy_area(0,0,width,height,temp,ox,oy)
+                self.get_model().set_value(self.last,1,temp)
+                tip="File: %s"%os.path.basename(file)+"\nDimensions: %dx%d"%(owidth,oheight)
+                self.get_model().set_value(self.last,2,tip)
+            except:
+                pass
+            yield True
+            self.last=self.get_model().iter_next(self.last)
+        yield False
+
+class ImageViewer(gtk.Window):
+    __gsignals__ = {"destroy": "override", "configure-event": "override"}
+    def __init__(self,filename,auto_fit,use_fullscreen):
+        gtk.Window.__init__(self)
+        self.filename=filename
+        self.auto_fit=auto_fit
+        self.use_fullscreen=use_fullscreen
+        self.browser=False
+        self.zoom=1.0
+        self.timeout=0
+        self.oldsize=(0,0)
+        self.first=True
+        self.image=gtk.Image()
+        self.pixbuf=gtk.gdk.Pixbuf(gtk.gdk.COLORSPACE_RGB,True,8,100,100)
+        self.scrollwin=gtk.ScrolledWindow()
+        self.view=gtk.Viewport()
+        self.view.set_shadow_type(gtk.SHADOW_NONE)
+        self.view.add(self.image)
+        self.view.show_all()
+        self.scrollwin.set_policy(gtk.POLICY_AUTOMATIC,gtk.POLICY_AUTOMATIC)
+        self.add(self.scrollwin)
+        self.toggle_fullscreen()
+        self.collection=ImageCollection()
+        self.collection.connect('item-activated',self.open_file)
+        self.collection.show_all()
+        if os.path.isdir(filename):
+            self.browser=True
+        self.toggle_browser()
+        self.show_all()
+
+    def open_file(self,iconview,path):
+        self.filename=os.path.join(iconview.dirname,iconview.get_model().get_value(iconview.get_model().get_iter(path),0))
+        print self.filename
+        self.toggle_browser()
+
+    def scale_image(self,fast=False):
+        if self.zoom == 1.0:
+            self.image.set_from_pixbuf(self.pixbuf)
+        else:
+            if fast:
+                self.image.set_from_pixbuf(self.pixbuf.scale_simple(int(self.pixbuf.get_width()*self.zoom),int(self.pixbuf.get_height()*self.zoom),gtk.gdk.INTERP_NEAREST))
+            else:
+                self.image.set_from_pixbuf(self.pixbuf.scale_simple(int(self.pixbuf.get_width()*self.zoom),int(self.pixbuf.get_height()*self.zoom),gtk.gdk.INTERP_BILINEAR))
+
+    def zoom_fit(self,fast=False):
+        size=self.get_size()
+        fx=float(size[0])/self.pixbuf.get_width()
+        fy=float(size[1])/self.pixbuf.get_height()
+        self.zoom=min(fx,fy)
+        self.scale_image(fast)
+
+    def zoom_normal(self):
+        self.zoom=1.0
+        self.scale_image()
+
+    def zoom_in(self):
+        self.zoom=float(int(self.zoom*10+0.5))/10.0
+        if self.zoom < 10.0:
+            if self.zoom < 1.0:
+                self.zoom=self.zoom+0.1
+            else:
+                self.zoom=self.zoom+0.5
+        self.scale_image()
+
+    def zoom_out(self):
+        self.zoom=float(int(self.zoom*10))/10.0
+        if self.zoom > 0.1:
+            if self.zoom > 1.0:
+                self.zoom=self.zoom-0.5
+            else:
+                self.zoom=self.zoom-0.1
+        self.scale_image()
+
+    def toggle_fullscreen(self):
+        if self.use_fullscreen:
+            self.fullscreen()
+        else:
+            self.unfullscreen()
+        self.use_fullscreen=not self.use_fullscreen
+
+    def toggle_browser(self):
+        if self.scrollwin.get_child():
+            self.scrollwin.remove(self.scrollwin.get_child())
+        dirname=self.filename
+        if not os.path.isdir(dirname):
+            dirname=os.path.dirname(dirname)
+            if dirname == '':
+                dirname='.'
+        if self.collection.dirname != dirname:
+            self.collection.dirname=dirname
+            self.collection.update()
+        if os.path.isdir(self.filename) and len(self.collection.files) > 0:
+            self.filename=os.path.join(dirname,self.collection.files[0])
+        if self.browser:
+            self.scrollwin.add(self.collection)
+            self.set_title('%s - pyview'%dirname)
+        else:
+            self.scrollwin.add(self.view)
+            self.change_image()
+            self.set_default_size(self.pixbuf.get_width(),self.pixbuf.get_height())
+        self.browser=not self.browser
+
+    def change_image(self):
+        self.pixbuf=gtk.gdk.pixbuf_new_from_file(self.filename)
+        self.scale_image()
+        self.set_title('%s - pyview'%self.filename)
+
+    def do_key_press_event(self,event):
+        if event.keyval == gtk.keysyms.F:
+            self.toggle_fullscreen()
+        elif event.keyval == gtk.keysyms.f:
+            self.zoom_fit()
+            self.auto_fit=not self.auto_fit
+        elif event.keyval == gtk.keysyms._0:
+            self.zoom_normal()
+        elif event.keyval == gtk.keysyms.minus:
+            self.zoom_out()
+        elif event.keyval == gtk.keysyms.equal:
+            self.zoom_in()
+        elif event.keyval == gtk.keysyms.b:
+            self.toggle_browser()
+        elif event.keyval == gtk.keysyms.n:
+            for i,name in enumerate(self.collection.files):
+                if name == os.path.basename(self.filename):
+                    i=(i+1)%len(self.collection.files)
+                    self.filename=os.path.join(self.collection.dirname,self.collection.files[i])
+                    model=self.collection.get_model()
+                    self.collection.select_path(model.get_path(model.iter_nth_child(None,i)))
+                    self.change_image()
+                    break
+        elif event.keyval == gtk.keysyms.p:
+            for i,name in enumerate(self.collection.files):
+                if name == os.path.basename(self.filename):
+                    i=(i-1)%len(self.collection.files)
+                    self.filename=os.path.join(self.collection.dirname,self.collection.files[i])
+                    model=self.collection.get_model()
+                    self.collection.select_path(model.get_path(model.iter_nth_child(None,i)))
+                    self.change_image()
+                    break
+        elif event.keyval == gtk.keysyms.j:
+            vadj=self.scrollwin.get_vadjustment()
+            if vadj.value+vadj.step_increment < vadj.upper-vadj.page_size:
+                vadj.value=vadj.value+vadj.step_increment
+            else:
+                vadj.value=vadj.upper-vadj.page_size
+        elif event.keyval == gtk.keysyms.k:
+            vadj=self.scrollwin.get_vadjustment()
+            if vadj.value-vadj.step_increment > vadj.lower:
+                vadj.value=vadj.value-vadj.step_increment
+            else:
+                vadj.value=vadj.lower
+        elif event.keyval == gtk.keysyms.l:
+            hadj=self.scrollwin.get_hadjustment()
+            if hadj.value+hadj.step_increment < hadj.upper-hadj.page_size:
+                hadj.value=hadj.value+hadj.step_increment
+            else:
+                hadj.value=hadj.upper-hadj.page_size
+        elif event.keyval == gtk.keysyms.h:
+            hadj=self.scrollwin.get_hadjustment()
+            if hadj.value-hadj.step_increment > hadj.lower:
+                hadj.value=hadj.value-hadj.step_increment
+            else:
+                hadj.value=hadj.lower
+        elif event.keyval == gtk.keysyms.q:
+            gtk.main_quit()
+        else:
+            return
+        self.chain(event)
+
+    def do_destroy(self):
+        gtk.main_quit()
+
+    def do_configure_event(self,event):
+        if event.type == gtk.gdk.CONFIGURE and (event.width,event.height) != self.oldsize:
+            self.oldsize=(event.width,event.height)
+            if self.browser:
+                if self.auto_fit:
+                    self.timeout=self.timeout+1
+                    gobject.timeout_add(500,self.render)
+                    self.zoom_fit(True)
+                elif self.first:
+                    if self.pixbuf.get_width() > event.width or self.pixbuf.get_height() > event.height:
+                        self.timeout=self.timeout+1
+                        gobject.timeout_add(500,self.render)
+                        self.first=False
+                        self.zoom_fit(True)
+        self.chain(event)
+
+    def render(self):
+        self.timeout=self.timeout-1
+        if self.timeout == 0:
+            self.scale_image()
+        return False
+
+def run(args):
+    if len(args) > 0:
+        auto_fit=False
+        fullscreen=False
+        for arg in args:
+            if arg == '--fullscreen':
+                fullscreen=True
+            if arg == '--auto-fit':
+                auto_fit=True
+            else:
+                filename=arg
+        ImageViewer(filename,auto_fit,fullscreen)
+        gtk.main()
+    else:
+        print "Usage: pyview filename [--auto-fit] [--fullscreen]"
+
+if __name__ == "__main__":
+    run(sys.argv[1:])
